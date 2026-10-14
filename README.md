@@ -70,4 +70,4 @@ Database connection details must be supplied through environment variables or a 
 
 ## Known Limitations
 
-Performance on the full 100,000-record evaluation dataset has not been independently benchmarked.
+A separate synthetic MongoDB dataset with 100,000 attendance records was benchmarked. All tested endpoints returned HTTP 200; inspected query plans used IXSCAN with no COLLSCAN. Startup completed in 3.41 seconds. The 31-day department trend reached 5.41 seconds (a benchmark warning, not an official cutoff). These measurements are not a guarantee of performance on HROne's hidden dataset.

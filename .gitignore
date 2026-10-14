@@ -1,0 +1,13 @@
+# Python-generated caches
+__pycache__/
+*.py[cod]
+
+# Local environments and credentials
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Local operating-system artifacts
+.DS_Store

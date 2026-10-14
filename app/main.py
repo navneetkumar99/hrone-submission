@@ -60,6 +60,22 @@ def serialize_for_api(value):
 
     return value
 
+def serialize_attendance_for_api(document):
+    result = serialize_for_api(document)
+    defaults = {
+        "punch_in": None,
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+    for field, default in defaults.items():
+        result.setdefault(field, default)
+    return result
+
+
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
@@ -194,7 +210,10 @@ def get_month_bounds(month):
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
         raise HTTPException(422, "Invalid month")
 
-    first_day = date.fromisoformat(month + "-01")
+    try:
+        first_day = date.fromisoformat(month + "-01")
+    except ValueError:
+        raise HTTPException(422, "Invalid month")
 
     last_day_number = calendar.monthrange(
         first_day.year,
@@ -707,6 +726,13 @@ class PunchInIn(BaseModel):
     )
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
+    @field_validator("punched_at", mode="before")
+    @classmethod
+    def validate_provided_timestamp(cls, value):
+        if value is None:
+            raise ValueError("punched_at cannot be null when provided")
+        return value
+
 
 
 class PunchOutIn(BaseModel):
@@ -716,6 +742,15 @@ class PunchOutIn(BaseModel):
         ge=100000000000,
         le=4102444800000
     )
+
+    @field_validator("punched_at", mode="before")
+    @classmethod
+    def validate_provided_timestamp(cls, value):
+        if value is None:
+            raise ValueError("punched_at cannot be null when provided")
+        return value
+
+
 
 class RegularizeIn(BaseModel):
     status: Optional[
@@ -853,7 +888,7 @@ def punch_in(body: PunchInIn):
             detail="Already punched in for this date"
         )
 
-    return serialize_for_api(doc)
+    return serialize_attendance_for_api(doc)
 
 
 
@@ -950,7 +985,7 @@ def punch_out(body: PunchOutIn):
             detail="Already punched out"
         )
 
-    return serialize_for_api(updated)
+    return serialize_attendance_for_api(updated)
 
 
 def build_attendance_query(
@@ -1013,7 +1048,7 @@ def list_attendance(
     total = db.attendance_logs.count_documents(q)
     page_docs = list(db.attendance_logs.find(q).sort([("date", -1), ("emp_code", 1)]).skip((page - 1) * page_size).limit(page_size))
     
-    page_docs = [serialize_for_api(d) for d in page_docs]
+    page_docs = [serialize_attendance_for_api(d) for d in page_docs]
 
     for d in page_docs:
         d.setdefault("history", [])
@@ -1141,7 +1176,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
             409, "Attendance was modified by another request"
         )
 
-    return serialize_for_api(updated)
+    return serialize_attendance_for_api(updated)
 
 
 
