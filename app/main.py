@@ -1,3 +1,4 @@
+import json
 """
 Employee Attendance & Analytics API - STARTER
 
@@ -116,7 +117,7 @@ def recalculate_attendance(
         )
 
     late = compute_late_minutes(
-        punch_in, employee["shift_start"]
+        punch_in, employee["shift_start"], attendance_date
     )
 
     if punch_out is None:
@@ -415,37 +416,23 @@ def department_summary(
 # Helpers
 # --------------------------------------------------------------------------- #
 
-def compute_late_minutes(punch_in, shift_start):
+def compute_late_minutes(punch_in, shift_start, attendance_date=None):
     if punch_in.tzinfo is None:
         punch_in = punch_in.replace(tzinfo=timezone.utc)
 
     punch_ist = punch_in.astimezone(IST)
+    if attendance_date is None:
+        attendance_date = punch_ist.date().isoformat()
 
     h, m = map(int, shift_start.split(":"))
+    start = datetime.combine(
+        date.fromisoformat(attendance_date),
+        datetime.min.time(),
+        tzinfo=IST
+    ).replace(hour=h, minute=m)
 
-    today_start = punch_ist.replace(
-        hour=h,
-        minute=m,
-        second=0,
-        microsecond=0
-    )
-
-    possible_starts = [
-        today_start - timedelta(days=1),
-        today_start,
-        today_start + timedelta(days=1)
-    ]
-
-    start = min(
-        possible_starts,
-        key=lambda dt: abs((punch_ist - dt).total_seconds())
-    )
-
-    
     elapsed_seconds = (punch_ist - start).total_seconds()
-    minutes = int(elapsed_seconds // 60)
-
-    return minutes if elapsed_seconds > 600 else 0
+    return int(elapsed_seconds // 60) if elapsed_seconds > 600 else 0
 
 
 def compute_work_hours(punch_in, punch_out):
@@ -549,12 +536,14 @@ def build_monthly_pipeline(emp_code, month):
     return pipeline
 
 
+
 def get_monthly_log_totals(emp_code, month):
     pipeline = build_monthly_pipeline(emp_code, month)
 
-    
-    return pipeline
+    results = list(db.attendance_logs.aggregate(pipeline))
 
+    if results:
+        return results[0]
 
     return {
         "present_days": 0,
@@ -563,6 +552,7 @@ def get_monthly_log_totals(emp_code, month):
         "total_late_minutes": 0,
         "total_overtime_minutes": 0
     }
+
 
 
 @app.get("/analytics/employees/{emp_code}/monthly")
@@ -779,15 +769,25 @@ def health():
 
 
 
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+
+    doc["created_at"] = datetime.now(
+        timezone.utc
+    ).replace(microsecond=0)
+
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="emp_code already exists"
+        )
+
+    return serialize_for_api(doc)
+
 
 
 @app.get("/employees")
@@ -800,7 +800,7 @@ def list_employees(department: Optional[str] = None, page: int = Query(1, ge=1),
     total = db.employees.count_documents(q)
 
     items = list(db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return {"items": [serialize_for_api(item) for item in items], "total": total, "page": page, "page_size": page_size}
 
 
 
@@ -838,7 +838,7 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, emp["shift_start"], d),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -960,6 +960,19 @@ def build_attendance_query(
     status=None
 ):
     q = {}
+    for field_name, value in (("date_from", date_from), ("date_to", date_to)):
+        if value is not None:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise HTTPException(422, f"Invalid {field_name}")
+            try:
+                date.fromisoformat(value)
+            except ValueError:
+                raise HTTPException(422, f"Invalid {field_name}")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "Invalid date range")
+    if status is not None and status not in ("PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"):
+        raise HTTPException(422, "Invalid status")
+
 
     if emp_code:
         q["emp_code"] = emp_code
@@ -1602,6 +1615,15 @@ def create_database_indexes():
         name="date_employee_index"
     )
 
+    db.employees.create_index(
+        [("joined_on", ASCENDING)],
+        name="joined_on_index"
+    )
+    db.attendance_logs.create_index(
+        [("date", -1), ("emp_code", 1)],
+        name="date_desc_employee_index"
+    )
+
     print("MongoDB indexes ready")
 
 
@@ -1623,6 +1645,9 @@ def admin_explain(
     to_date: Optional[str] = Query(None, alias="to"),
 
 ):
+
+    if endpoint not in {"attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"}:
+        raise HTTPException(422, "Unsupported explain endpoint")
 
     if endpoint == "attendance_list":
 
@@ -1651,10 +1676,11 @@ def admin_explain(
             verbosity="executionStats"
         )
 
-        return Response(
-            content=json_util.dumps(result),
-            media_type="application/json"
-        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees" if endpoint in ("department_summary", "department_trend") else "attendance_logs",
+            "explain": json.loads(json_util.dumps(result))
+        }
     
     if endpoint == "employee_monthly":
 
@@ -1689,10 +1715,11 @@ def admin_explain(
             verbosity="executionStats"
         )
 
-        return Response(
-            content=json_util.dumps(result),
-            media_type="application/json"
-        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees" if endpoint in ("department_summary", "department_trend") else "attendance_logs",
+            "explain": json.loads(json_util.dumps(result))
+        }
     
     if endpoint == "department_summary":
         if not month:
@@ -1716,10 +1743,11 @@ def admin_explain(
             verbosity="executionStats"
         )
 
-        return Response(
-            content=json_util.dumps(result),
-            media_type="application/json"
-        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees" if endpoint in ("department_summary", "department_trend") else "attendance_logs",
+            "explain": json.loads(json_util.dumps(result))
+        }
     
     if endpoint == "late_leaderboard":
         if not month:
@@ -1742,10 +1770,11 @@ def admin_explain(
             verbosity="executionStats"
         )
 
-        return Response(
-            content=json_util.dumps(result),
-            media_type="application/json"
-        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees" if endpoint in ("department_summary", "department_trend") else "attendance_logs",
+            "explain": json.loads(json_util.dumps(result))
+        }
 
     
     if endpoint == "department_trend":
@@ -1772,10 +1801,11 @@ def admin_explain(
             verbosity="executionStats"
         )
 
-        return Response(
-            content=json_util.dumps(result),
-            media_type="application/json"
-        )
+        return {
+            "endpoint": endpoint,
+            "collection": "employees" if endpoint in ("department_summary", "department_trend") else "attendance_logs",
+            "explain": json.loads(json_util.dumps(result))
+        }
 
 
 
